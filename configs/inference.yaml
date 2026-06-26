@@ -2,14 +2,14 @@ infer:
   full_imgsz: 640
   slice_imgsz: 640
   full_conf: 0.01
-  output_conf: 0.25
+  output_conf: 0.30
   iou: 0.7
   merge_iou: 0.5
   max_det: 3000
   min_slice_detections: 1
-  min_slice_utility: 0.5
-  duplicate_iou: 0.5
-  max_slice_attempts: 16
+  min_slice_utility: 0.8
+  duplicate_iou: 0.4
+  max_slice_attempts: 10
   require_stop_for_acceptance: true
   target_classes:
     - 0

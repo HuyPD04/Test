@@ -23,7 +23,8 @@
       "attempted_slice_overlap": 0.0,
       "stop_due_to_stalled_roi": false,
       "detections": 16,
-      "new_detections_after_nms": 16
+      "new_detections_after_nms": 15,
+      "new_detection_utility": 7.19329833984375
     },
     {
       "attempt_index": 2,
@@ -44,7 +45,8 @@
       "attempted_slice_overlap": 0.0,
       "stop_due_to_stalled_roi": false,
       "detections": 19,
-      "new_detections_after_nms": 19
+      "new_detections_after_nms": 19,
+      "new_detection_utility": 10.846813201904297
     },
     {
       "attempt_index": 3,
@@ -65,7 +67,8 @@
       "attempted_slice_overlap": 0.0,
       "stop_due_to_stalled_roi": false,
       "detections": 13,
-      "new_detections_after_nms": 11
+      "new_detections_after_nms": 10,
+      "new_detection_utility": 5.1776251792907715
     },
     {
       "attempt_index": 4,
@@ -86,7 +89,8 @@
       "attempted_slice_overlap": 0.0,
       "stop_due_to_stalled_roi": false,
       "detections": 13,
-      "new_detections_after_nms": 10
+      "new_detections_after_nms": 9,
+      "new_detection_utility": 5.922885894775391
     },
     {
       "attempt_index": 5,
@@ -107,7 +111,8 @@
       "attempted_slice_overlap": 0.0,
       "stop_due_to_stalled_roi": false,
       "detections": 14,
-      "new_detections_after_nms": 13
+      "new_detections_after_nms": 12,
+      "new_detection_utility": 5.685584545135498
     },
     {
       "attempt_index": 6,
@@ -128,7 +133,8 @@
       "attempted_slice_overlap": 0.3303571939468384,
       "stop_due_to_stalled_roi": false,
       "detections": 23,
-      "new_detections_after_nms": 15
+      "new_detections_after_nms": 13,
+      "new_detection_utility": 9.110343933105469
     },
     {
       "attempt_index": 7,
@@ -149,7 +155,8 @@
       "attempted_slice_overlap": 0.16028916835784912,
       "stop_due_to_stalled_roi": false,
       "detections": 16,
-      "new_detections_after_nms": 14
+      "new_detections_after_nms": 13,
+      "new_detection_utility": 7.180715560913086
     },
     {
       "attempt_index": 8,
@@ -157,23 +164,29 @@
       "accepted": true,
       "rejection_reason": null,
       "roi": [
-        628.7999877929688,
-        827.5499877929688,
-        931.2000122070312,
-        1079.0
+        911.74365234375,
+        443.5313720703125,
+        1289.74365234375,
+        758.25634765625
       ],
       "actions": [
+        "zoom_out",
+        "up_right",
+        "up_right",
+        "up_right",
+        "up_right",
         "stop"
       ],
-      "steps": 1,
-      "old_slice_overlap": 0.0,
-      "attempted_slice_overlap": 0.0,
+      "steps": 6,
+      "old_slice_overlap": 0.4280288815498352,
+      "attempted_slice_overlap": 0.4280288815498352,
       "stop_due_to_stalled_roi": false,
-      "detections": 4,
-      "new_detections_after_nms": 3
+      "detections": 16,
+      "new_detections_after_nms": 5,
+      "new_detection_utility": 2.8236846923828125
     }
   ],
-  "detections": 138,
+  "detections": 140,
   "prediction_file": "C:\\Users\\Admin\\OneDrive\\Desktop\\term 9\\RL-SAHI\\runs\\infer\\detections\\0000127_00002_d_0000119.txt",
   "visualization_file": "C:\\Users\\Admin\\OneDrive\\Desktop\\term 9\\RL-SAHI\\runs\\infer\\visualizations\\0000127_00002_d_0000119.jpg"
 }

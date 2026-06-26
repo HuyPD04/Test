@@ -16,7 +16,7 @@ from rl_sahi.common.data import image_to_label_path, iter_images, read_yolo_labe
 from rl_sahi.common.device import resolve_torch_device
 from rl_sahi.detection.yolo import detect_one_image, load_yolo
 from rl_sahi.inference.config import InferenceConfig
-from rl_sahi.inference.crops import run_yolo_on_crop
+from rl_sahi.inference.crops import run_yolo_on_crop, run_yolo_on_crops
 from rl_sahi.inference.merge import class_aware_nms
 from rl_sahi.inference.pipeline import (
     _attempt_overlap,
@@ -141,30 +141,30 @@ def _predict_fixed_sahi(
     det: DetectionCache,
     cfg: InferenceConfig,
     bench_cfg: BenchmarkConfig,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
     full_boxes, full_scores, full_classes = _full_predictions(det, cfg)
     boxes_parts = [full_boxes]
     scores_parts = [full_scores]
     classes_parts = [full_classes]
     rois = _fixed_grid_rois(det.image_shape, bench_cfg.fixed_slice_fraction, bench_cfg.fixed_overlap)
-    for roi in rois:
-        boxes_i, scores_i, classes_i = run_yolo_on_crop(
-            model,
-            image_path,
-            roi,
-            imgsz=cfg.slice_imgsz,
-            conf=cfg.output_conf,
-            iou=cfg.iou,
-            max_det=cfg.max_det,
-            device=cfg.device,
-        )
+    crop_predictions = run_yolo_on_crops(
+        model,
+        [image_path] * len(rois),
+        rois,
+        imgsz=cfg.slice_imgsz,
+        conf=cfg.output_conf,
+        iou=cfg.iou,
+        max_det=cfg.max_det,
+        device=cfg.device,
+    )
+    for boxes_i, scores_i, classes_i in crop_predictions:
         classes_i = cfg.class_mapping.map_model_classes(classes_i)
         boxes_i, scores_i, classes_i = _filter_classes(boxes_i, scores_i, classes_i, cfg.target_classes)
         boxes_parts.append(boxes_i)
         scores_parts.append(scores_i)
         classes_parts.append(classes_i)
     boxes, scores, classes = _merge_predictions(det.image_shape, cfg.merge_iou, boxes_parts, scores_parts, classes_parts)
-    return boxes, scores, classes, len(rois)
+    return boxes, scores, classes, len(rois), len(rois)
 
 
 def _predict_rl_sahi(
@@ -176,13 +176,14 @@ def _predict_rl_sahi(
     cfg: InferenceConfig,
     env_cfg,
     state_cfg: StateConfig,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
     full_boxes, full_scores, full_classes = _full_predictions(det, cfg)
     slice_boxes_all: list[np.ndarray] = []
     slice_scores_all: list[np.ndarray] = []
     slice_classes_all: list[np.ndarray] = []
     accepted_rois: list[np.ndarray] = []
     attempted_rois: list[np.ndarray] = []
+    crop_inference_count = 0
     max_attempts = int(cfg.max_slice_attempts) if cfg.max_slice_attempts > 0 else int(env_cfg.max_slices * 2)
     for _attempt_idx in range(1, max_attempts + 1):
         if len(accepted_rois) >= env_cfg.max_slices:
@@ -224,6 +225,7 @@ def _predict_rl_sahi(
             if repeat_attempt_overlap >= 0.95:
                 break
             continue
+        crop_inference_count += 1
         boxes_i, scores_i, classes_i = run_yolo_on_crop(
             model,
             image_path,
@@ -282,7 +284,7 @@ def _predict_rl_sahi(
         [full_scores, *slice_scores_all],
         [full_classes, *slice_classes_all],
     )
-    return boxes, scores, classes, len(accepted_rois)
+    return boxes, scores, classes, len(accepted_rois), crop_inference_count
 
 
 def _ap_from_pr(tp: np.ndarray, fp: np.ndarray, total_gt: int) -> float:
@@ -397,6 +399,7 @@ def evaluate_rl_sahi_policy(
     ground_truth: dict[str, tuple[np.ndarray, np.ndarray, tuple[int, int]]] = {}
     predictions: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
     crops: list[int] = []
+    accepted_crops: list[int] = []
     latency: list[float] = []
 
     for image_path in images:
@@ -429,7 +432,7 @@ def evaluate_rl_sahi_policy(
         )
 
         start = time.perf_counter()
-        boxes, scores, classes, crop_count = _predict_rl_sahi(
+        boxes, scores, classes, accepted_crop_count, crop_count = _predict_rl_sahi(
             model,
             policy,
             device_t,
@@ -442,6 +445,7 @@ def evaluate_rl_sahi_policy(
         predictions[image_id] = (boxes, scores, classes)
         latency.append(time.perf_counter() - start)
         crops.append(crop_count)
+        accepted_crops.append(accepted_crop_count)
 
     metrics = _evaluate_method(
         predictions,
@@ -453,6 +457,7 @@ def evaluate_rl_sahi_policy(
     return {
         **metrics,
         "crops_per_image": float(np.mean(crops)),
+        "accepted_crops_per_image": float(np.mean(accepted_crops)),
         "latency_ms_per_image": float(np.mean(latency) * 1000.0),
         "images": float(len(images)),
         "small_area_threshold": small_threshold,
@@ -498,6 +503,7 @@ def benchmark_split(
     ground_truth: dict[str, tuple[np.ndarray, np.ndarray, tuple[int, int]]] = {}
     predictions = {"yolo_full": {}, "fixed_grid_sahi": {}, "rl_sahi": {}}
     crops = {key: [] for key in predictions}
+    accepted_crops = {key: [] for key in predictions}
     latency = {key: [] for key in predictions}
 
     for image_path in images:
@@ -533,20 +539,25 @@ def benchmark_split(
         predictions["yolo_full"][image_id] = _full_predictions(det, infer_cfg)
         latency["yolo_full"].append(time.perf_counter() - start)
         crops["yolo_full"].append(0)
+        accepted_crops["yolo_full"].append(0)
 
         start = time.perf_counter()
-        boxes, scores, classes, crop_count = _predict_fixed_sahi(model, image_path, det, infer_cfg, bench_cfg)
+        boxes, scores, classes, accepted_crop_count, crop_count = _predict_fixed_sahi(
+            model, image_path, det, infer_cfg, bench_cfg
+        )
         predictions["fixed_grid_sahi"][image_id] = (boxes, scores, classes)
         latency["fixed_grid_sahi"].append(time.perf_counter() - start)
         crops["fixed_grid_sahi"].append(crop_count)
+        accepted_crops["fixed_grid_sahi"].append(accepted_crop_count)
 
         start = time.perf_counter()
-        boxes, scores, classes, crop_count = _predict_rl_sahi(
+        boxes, scores, classes, accepted_crop_count, crop_count = _predict_rl_sahi(
             model, policy, device_t, image_path, det, infer_cfg, env_cfg, state_cfg
         )
         predictions["rl_sahi"][image_id] = (boxes, scores, classes)
         latency["rl_sahi"].append(time.perf_counter() - start)
         crops["rl_sahi"].append(crop_count)
+        accepted_crops["rl_sahi"].append(accepted_crop_count)
 
     rows: list[dict[str, float | str]] = []
     for method, method_predictions in predictions.items():
@@ -562,6 +573,7 @@ def benchmark_split(
                 "method": method,
                 **metrics,
                 "crops_per_image": float(np.mean(crops[method])),
+                "accepted_crops_per_image": float(np.mean(accepted_crops[method])),
                 "latency_ms_per_image": float(np.mean(latency[method]) * 1000.0),
                 "images": float(len(images)),
                 "small_area_threshold": small_threshold,

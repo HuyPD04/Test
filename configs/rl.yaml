@@ -108,3 +108,4 @@ train:
   crop_outcome_reward_scale: 0.1
   accepted_no_hard_penalty: 2.0
   rejected_crop_penalty: 0.5
+  crop_attempt_penalty: 0.25

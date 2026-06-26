@@ -13,6 +13,10 @@ def crop_roi(image_path: Path, roi: np.ndarray) -> tuple[np.ndarray, tuple[int, 
     image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if image is None:
         raise FileNotFoundError(f"Cannot read image: {image_path}")
+    return crop_array(image, roi)
+
+
+def crop_array(image: np.ndarray, roi: np.ndarray) -> tuple[np.ndarray, tuple[int, int]]:
     x1, y1, x2, y2 = [int(round(v)) for v in roi]
     x1 = max(x1, 0)
     y1 = max(y1, 0)
@@ -64,8 +68,16 @@ def run_yolo_on_crops(
     crops: list[np.ndarray] = []
     offsets: list[tuple[int, int]] = []
     output_indices: list[int] = []
+    image_cache: dict[Path, np.ndarray] = {}
     for index, (image_path, roi) in enumerate(zip(image_paths, rois)):
-        crop, offset = crop_roi(Path(image_path), roi)
+        image_path = Path(image_path)
+        image = image_cache.get(image_path)
+        if image is None:
+            image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+            if image is None:
+                raise FileNotFoundError(f"Cannot read image: {image_path}")
+            image_cache[image_path] = image
+        crop, offset = crop_array(image, roi)
         if crop.size == 0:
             continue
         crops.append(crop)

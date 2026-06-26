@@ -83,6 +83,7 @@ class TrainConfig:
     crop_outcome_reward_scale: float = 0.1
     accepted_no_hard_penalty: float = 2.0
     rejected_crop_penalty: float = 0.5
+    crop_attempt_penalty: float = 0.25
 
 def epsilon_by_step(step: int, cfg: TrainConfig) -> float:
     frac = min(float(step) / max(cfg.epsilon_decay_steps, 1), 1.0)
@@ -158,14 +159,25 @@ def _terminal_reward_with_crop_outcome(
     crop_scale = max(float(cfg.crop_outcome_reward_scale), 0.0)
     crop_reward = float(outcome.reward) * crop_scale
     negative_crop_reward = min(float(outcome.reward), 0.0) * crop_scale
+    attempt_penalty = max(float(getattr(cfg, "crop_attempt_penalty", 0.0)), 0.0)
 
     if hard_new_hits > 0:
         hard_reward = float(cfg.hard_hit_reward) * float(hard_new_hits)
         rejected_penalty = 0.0 if outcome.accepted else float(cfg.rejected_crop_penalty)
-        return float(base_reward + hard_reward + crop_reward - rejected_penalty)
+        return float(base_reward + hard_reward + crop_reward - rejected_penalty - attempt_penalty)
     if outcome.accepted:
-        return float(min(base_reward, 0.0) + negative_crop_reward - float(cfg.accepted_no_hard_penalty))
-    return float(min(base_reward, 0.0) + negative_crop_reward - float(cfg.rejected_crop_penalty))
+        return float(
+            min(base_reward, 0.0)
+            + negative_crop_reward
+            - float(cfg.accepted_no_hard_penalty)
+            - attempt_penalty
+        )
+    return float(
+        min(base_reward, 0.0)
+        + negative_crop_reward
+        - float(cfg.rejected_crop_penalty)
+        - attempt_penalty
+    )
 
 
 def optimize(
