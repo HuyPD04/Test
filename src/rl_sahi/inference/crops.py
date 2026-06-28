@@ -97,7 +97,6 @@ def run_yolo_on_crops(
         max_det=max_det,
         batch=len(crops),
         device=resolved_device,
-        half=resolved_device.type == "cuda",
         verbose=False,
     )
     for output_index, offset, result in zip(output_indices, offsets, results):

@@ -48,7 +48,6 @@ def detect_one_image(
             iou=iou,
             max_det=max_det,
             device=resolved_device,
-            half=resolved_device.type == "cuda",
             verbose=False,
         )
         feature = collector.vector()
