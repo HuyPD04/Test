@@ -16,13 +16,14 @@ from rl_sahi.common.data import image_to_label_path, iter_images, read_yolo_labe
 from rl_sahi.common.device import resolve_torch_device
 from rl_sahi.detection.yolo import detect_one_image, load_yolo
 from rl_sahi.inference.config import InferenceConfig
-from rl_sahi.inference.crops import run_yolo_on_crop, run_yolo_on_crops
+from rl_sahi.inference.crops import run_yolo_on_crops
 from rl_sahi.inference.merge import class_aware_nms
 from rl_sahi.inference.pipeline import (
     _attempt_overlap,
     _filter_classes,
     _new_detection_gain,
     _new_detection_utility,
+    _skip_crop_reason,
     get_initial_detection,
 )
 from rl_sahi.inference.rollout import rollout_one_slice
@@ -185,97 +186,104 @@ def _predict_rl_sahi(
     attempted_rois: list[np.ndarray] = []
     crop_inference_count = 0
     max_attempts = int(cfg.max_slice_attempts) if cfg.max_slice_attempts > 0 else int(env_cfg.max_slices * 2)
-    for _attempt_idx in range(1, max_attempts + 1):
-        if len(accepted_rois) >= env_cfg.max_slices:
-            break
-        history_arr = np.stack(attempted_rois).astype(np.float32) if attempted_rois else np.zeros((0, 4), dtype=np.float32)
-        overlap_arr = np.stack(accepted_rois).astype(np.float32) if accepted_rois else np.zeros((0, 4), dtype=np.float32)
-        env = SliceEnv(
-            det,
-            None,
-            env_cfg=env_cfg,
-            state_cfg=state_cfg,
-            previous_rois=history_arr,
-            overlap_rois=overlap_arr,
-            target_classes=cfg.target_classes,
-            class_mapping=cfg.class_mapping,
-        )
-        roi, _actions, info = rollout_one_slice(policy, env, device_t)
-        if info.get("stop_due_to_old_overlap", False):
+    crop_batch_size = max(int(cfg.crop_batch_size), 1)
+    attempt_idx = 1
+    stop_attempts = False
+    while attempt_idx <= max_attempts and len(accepted_rois) < env_cfg.max_slices and not stop_attempts:
+        remaining_attempts = max_attempts - attempt_idx + 1
+        remaining_slices = max(int(env_cfg.max_slices) - len(accepted_rois), 1)
+        pending_limit = min(crop_batch_size, remaining_attempts, remaining_slices)
+        pending: list[tuple[np.ndarray, dict]] = []
+        while (
+            len(pending) < pending_limit
+            and attempt_idx <= max_attempts
+            and len(accepted_rois) < env_cfg.max_slices
+        ):
+            history_arr = (
+                np.stack(attempted_rois).astype(np.float32)
+                if attempted_rois
+                else np.zeros((0, 4), dtype=np.float32)
+            )
+            overlap_arr = (
+                np.stack(accepted_rois).astype(np.float32)
+                if accepted_rois
+                else np.zeros((0, 4), dtype=np.float32)
+            )
+            env = SliceEnv(
+                det,
+                None,
+                env_cfg=env_cfg,
+                state_cfg=state_cfg,
+                previous_rois=history_arr,
+                overlap_rois=overlap_arr,
+                target_classes=cfg.target_classes,
+                class_mapping=cfg.class_mapping,
+            )
+            roi, _actions, info = rollout_one_slice(policy, env, device_t)
             repeat_attempt_overlap = _attempt_overlap(roi, attempted_rois)
             attempted_rois.append(roi)
-            if repeat_attempt_overlap >= 0.95:
-                break
+            if _skip_crop_reason(info, cfg) is not None:
+                if repeat_attempt_overlap >= 0.95:
+                    stop_attempts = True
+                    break
+            else:
+                pending.append((roi, info))
+            attempt_idx += 1
+
+        if not pending:
             continue
-        if info.get("stop_due_to_attempted_overlap", False):
-            repeat_attempt_overlap = _attempt_overlap(roi, attempted_rois)
-            attempted_rois.append(roi)
-            if repeat_attempt_overlap >= 0.95:
-                break
-            continue
-        if cfg.require_stop_for_acceptance and info.get("stop_due_to_max_steps", False):
-            repeat_attempt_overlap = _attempt_overlap(roi, attempted_rois)
-            attempted_rois.append(roi)
-            if repeat_attempt_overlap >= 0.95:
-                break
-            continue
-        if cfg.require_stop_for_acceptance and info.get("stop_due_to_stalled_roi", False):
-            repeat_attempt_overlap = _attempt_overlap(roi, attempted_rois)
-            attempted_rois.append(roi)
-            if repeat_attempt_overlap >= 0.95:
-                break
-            continue
-        crop_inference_count += 1
-        boxes_i, scores_i, classes_i = run_yolo_on_crop(
+
+        predictions = run_yolo_on_crops(
             model,
-            image_path,
-            roi,
+            [image_path] * len(pending),
+            [roi for roi, _info in pending],
             imgsz=cfg.slice_imgsz,
             conf=cfg.output_conf,
             iou=cfg.iou,
             max_det=cfg.max_det,
             device=cfg.device,
         )
-        attempted_rois.append(roi)
-        classes_i = cfg.class_mapping.map_model_classes(classes_i)
-        boxes_i, scores_i, classes_i = _filter_classes(boxes_i, scores_i, classes_i, cfg.target_classes)
-        new_detection_gain = _new_detection_gain(
-            full_boxes,
-            full_scores,
-            full_classes,
-            slice_boxes_all,
-            slice_scores_all,
-            slice_classes_all,
-            boxes_i,
-            scores_i,
-            classes_i,
-            det.image_shape,
-            cfg.merge_iou,
-            cfg.duplicate_iou,
-        )
-        new_detection_utility = _new_detection_utility(
-            full_boxes,
-            full_scores,
-            full_classes,
-            slice_boxes_all,
-            slice_scores_all,
-            slice_classes_all,
-            boxes_i,
-            scores_i,
-            classes_i,
-            det.image_shape,
-            cfg.merge_iou,
-            cfg.duplicate_iou,
-        )
-        if (
-            new_detection_gain < int(cfg.min_slice_detections)
-            or new_detection_utility < float(cfg.min_slice_utility)
-        ):
-            continue
-        accepted_rois.append(roi)
-        slice_boxes_all.append(boxes_i)
-        slice_scores_all.append(scores_i)
-        slice_classes_all.append(classes_i)
+        crop_inference_count += len(pending)
+        for (roi, _info), (boxes_i, scores_i, classes_i) in zip(pending, predictions):
+            classes_i = cfg.class_mapping.map_model_classes(classes_i)
+            boxes_i, scores_i, classes_i = _filter_classes(boxes_i, scores_i, classes_i, cfg.target_classes)
+            new_detection_gain = _new_detection_gain(
+                full_boxes,
+                full_scores,
+                full_classes,
+                slice_boxes_all,
+                slice_scores_all,
+                slice_classes_all,
+                boxes_i,
+                scores_i,
+                classes_i,
+                det.image_shape,
+                cfg.merge_iou,
+                cfg.duplicate_iou,
+            )
+            new_detection_utility = _new_detection_utility(
+                full_boxes,
+                full_scores,
+                full_classes,
+                slice_boxes_all,
+                slice_scores_all,
+                slice_classes_all,
+                boxes_i,
+                scores_i,
+                classes_i,
+                det.image_shape,
+                cfg.merge_iou,
+                cfg.duplicate_iou,
+            )
+            if (
+                new_detection_gain < int(cfg.min_slice_detections)
+                or new_detection_utility < float(cfg.min_slice_utility)
+            ):
+                continue
+            accepted_rois.append(roi)
+            slice_boxes_all.append(boxes_i)
+            slice_scores_all.append(scores_i)
+            slice_classes_all.append(classes_i)
 
     boxes, scores, classes = _merge_predictions(
         det.image_shape,

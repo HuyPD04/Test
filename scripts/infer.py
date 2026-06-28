@@ -15,14 +15,24 @@ from rl_sahi.inference.config import InferenceConfig
 from rl_sahi.inference.pipeline import AdaptiveSahiInferencer
 
 
+def _bool_value(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run adaptive-slice inference and save boxes plus slice visualization.")
+    parser = argparse.ArgumentParser(description="Run adaptive-slice inference and save prediction metadata.")
     parser.add_argument("--config", type=Path, default=None)
     parser.add_argument("--image", type=Path, default=None)
     parser.add_argument("--split", default=None, choices=["train", "val", "test"])
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument("--visualize", action="store_true")
+    parser.add_argument("--no-visualize", action="store_true")
+    parser.add_argument("--no-save-predictions", action="store_true")
+    parser.add_argument("--no-metadata", action="store_true")
     args = parser.parse_args()
 
     cfg = load_default_config(args.config, ROOT)
@@ -49,6 +59,11 @@ def main() -> None:
         checkpoint = cfg.path_value("checkpoint")
     else:
         checkpoint = args.checkpoint if args.checkpoint.is_absolute() else ROOT / args.checkpoint
+    save_visualization = _bool_value(infer_cfg.get("save_visualization", False))
+    if args.visualize:
+        save_visualization = True
+    if args.no_visualize:
+        save_visualization = False
     inferencer = AdaptiveSahiInferencer(
         weights=cfg.path_value("weights"),
         checkpoint=checkpoint,
@@ -66,8 +81,12 @@ def main() -> None:
             min_slice_utility=float(infer_cfg.get("min_slice_utility", 0.5)),
             duplicate_iou=float(infer_cfg.get("duplicate_iou", infer_cfg.get("merge_iou", 0.5))),
             max_slice_attempts=int(infer_cfg.get("max_slice_attempts", 0)),
+            crop_batch_size=int(infer_cfg.get("crop_batch_size", 1)),
             target_classes=target_classes,
-            require_stop_for_acceptance=bool(infer_cfg.get("require_stop_for_acceptance", True)),
+            require_stop_for_acceptance=_bool_value(infer_cfg.get("require_stop_for_acceptance", True)),
+            save_predictions=_bool_value(infer_cfg.get("save_predictions", True)) and not args.no_save_predictions,
+            save_metadata=_bool_value(infer_cfg.get("save_metadata", True)) and not args.no_metadata,
+            save_visualization=save_visualization,
             class_mapping=ClassMapping.from_config(cfg.section("classes")),
         ),
     )
@@ -77,9 +96,17 @@ def main() -> None:
             out_dir=cfg.path_value("infer_out_dir"),
             cache_root=cfg.path_value("cache_root") if split is not None else None,
             split=split,
-            use_cache=bool(infer_cfg["use_cache"]) and not args.no_cache,
+            use_cache=_bool_value(infer_cfg["use_cache"]) and not args.no_cache,
         )
-        print(f"[infer] {image_path.name}: {meta['detections']} boxes, slices={meta['num_slices']}")
+        timing = meta.get("timing", {})
+        total_ms = float(timing.get("total_ms", 0.0))
+        crop_ms = float(timing.get("crop_inference_ms", 0.0))
+        print(
+            f"[infer] {image_path.name}: {meta['detections']} boxes, "
+            f"slices={meta['num_slices']} attempts={meta['num_attempts']} "
+            f"crops={meta['num_crop_predictions']}/{meta['num_crop_batches']} "
+            f"time={total_ms:.1f}ms crop={crop_ms:.1f}ms"
+        )
 
 
 if __name__ == "__main__":

@@ -20,6 +20,12 @@ def _int_tuple(value) -> tuple[int, ...]:
     return tuple(int(x) for x in value)
 
 
+def _bool_value(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark YOLO full, fixed-grid SAHI, and RL-SAHI.")
     parser.add_argument("--config", type=Path, default=None)
@@ -65,8 +71,12 @@ def main() -> None:
             min_slice_utility=float(infer_cfg.get("min_slice_utility", 0.5)),
             duplicate_iou=float(infer_cfg.get("duplicate_iou", infer_cfg.get("merge_iou", 0.5))),
             max_slice_attempts=int(infer_cfg.get("max_slice_attempts", 0)),
+            crop_batch_size=int(infer_cfg.get("crop_batch_size", 1)),
             target_classes=target_classes,
-            require_stop_for_acceptance=bool(infer_cfg.get("require_stop_for_acceptance", True)),
+            require_stop_for_acceptance=_bool_value(infer_cfg.get("require_stop_for_acceptance", True)),
+            save_predictions=False,
+            save_metadata=False,
+            save_visualization=False,
             class_mapping=class_mapping,
         ),
         bench_cfg=BenchmarkConfig(
@@ -79,7 +89,7 @@ def main() -> None:
         ),
         out_dir=out_dir,
         limit=args.limit,
-        use_cache=bool(infer_cfg.get("use_cache", True)) and not args.no_cache,
+        use_cache=_bool_value(infer_cfg.get("use_cache", True)) and not args.no_cache,
     )
     for row in rows:
         print(

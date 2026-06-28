@@ -10,7 +10,11 @@ infer:
   min_slice_utility: 0.8
   duplicate_iou: 0.4
   max_slice_attempts: 10
+  crop_batch_size: 4
   require_stop_for_acceptance: true
+  save_predictions: true
+  save_metadata: true
+  save_visualization: false
   target_classes:
     - 0
     - 2

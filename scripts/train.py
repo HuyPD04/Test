@@ -97,8 +97,12 @@ def main() -> None:
             min_slice_utility=float(infer_cfg.get("min_slice_utility", 0.5)),
             duplicate_iou=float(infer_cfg.get("duplicate_iou", infer_cfg.get("merge_iou", 0.5))),
             max_slice_attempts=int(infer_cfg.get("max_slice_attempts", 0)),
+            crop_batch_size=int(infer_cfg.get("crop_batch_size", 1)),
             target_classes=target_classes,
             require_stop_for_acceptance=bool(infer_cfg.get("require_stop_for_acceptance", True)),
+            save_predictions=False,
+            save_metadata=False,
+            save_visualization=False,
             class_mapping=class_mapping,
         ),
         bench_cfg=BenchmarkConfig(

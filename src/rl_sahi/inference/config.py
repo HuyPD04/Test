@@ -20,6 +20,10 @@ class InferenceConfig:
     min_slice_utility: float = 0.5
     duplicate_iou: float = 0.5
     max_slice_attempts: int = 0
+    crop_batch_size: int = 1
     target_classes: tuple[int, ...] = (0, 2, 3, 5, 8, 9)
     require_stop_for_acceptance: bool = True
+    save_predictions: bool = True
+    save_metadata: bool = True
+    save_visualization: bool = False
     class_mapping: ClassMapping = field(default_factory=ClassMapping)

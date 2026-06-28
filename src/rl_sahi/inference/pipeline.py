@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -21,7 +22,7 @@ from rl_sahi.common.config import ProjectConfig, load_default_config
 from rl_sahi.common.device import DeviceLike, resolve_torch_device
 from rl_sahi.detection.yolo import detect_one_image, load_yolo
 from rl_sahi.inference.config import InferenceConfig
-from rl_sahi.inference.crops import run_yolo_on_crop
+from rl_sahi.inference.crops import run_yolo_on_crops
 from rl_sahi.inference.merge import (
     class_aware_nms,
     new_detection_gain_after_merge,
@@ -137,6 +138,18 @@ def _attempt_overlap(roi: np.ndarray, attempted_rois: list[np.ndarray]) -> float
     inter = intersection_matrix(roi_arr, previous)[0]
     current_area = max(float(area(roi_arr)[0]), 1.0)
     return float(np.clip(inter.max() / current_area, 0.0, 1.0))
+
+
+def _skip_crop_reason(info: dict, cfg: InferenceConfig) -> str | None:
+    if info.get("stop_due_to_old_overlap", False):
+        return "old_slice_overlap"
+    if info.get("stop_due_to_attempted_overlap", False):
+        return "attempted_slice_overlap"
+    if cfg.require_stop_for_acceptance and info.get("stop_due_to_max_steps", False):
+        return "max_steps_without_stop"
+    if cfg.require_stop_for_acceptance and info.get("stop_due_to_stalled_roi", False):
+        return "stalled_without_stop"
+    return None
 
 
 def _checkpoint_detection_mismatches(
@@ -265,6 +278,8 @@ class AdaptiveSahiInferencer:
         use_cache: bool = True,
     ) -> dict:
         cfg = self.cfg
+        request_start = time.perf_counter()
+        detection_start = time.perf_counter()
         det = get_initial_detection(
             model=self.yolo,
             weights=self.weights,
@@ -281,6 +296,7 @@ class AdaptiveSahiInferencer:
             split=split,
             use_cache=use_cache,
         )
+        initial_detection_ms = (time.perf_counter() - detection_start) * 1000.0
 
         return _infer_with_loaded(
             image_path=image_path,
@@ -292,6 +308,8 @@ class AdaptiveSahiInferencer:
             state_cfg=self.state_cfg,
             det=det,
             cfg=cfg,
+            initial_detection_ms=initial_detection_ms,
+            request_start=request_start,
         )
 
 
@@ -305,8 +323,19 @@ def _infer_with_loaded(
     state_cfg: StateConfig,
     det: DetectionCache,
     cfg: InferenceConfig,
+    initial_detection_ms: float = 0.0,
+    request_start: float | None = None,
 ) -> dict:
-
+    if request_start is None:
+        request_start = time.perf_counter()
+    timing = {
+        "initial_detection_ms": float(initial_detection_ms),
+        "rollout_ms": 0.0,
+        "crop_inference_ms": 0.0,
+        "merge_ms": 0.0,
+        "write_outputs_ms": 0.0,
+        "total_ms": 0.0,
+    }
     accepted_rois: list[np.ndarray] = []
     rejected_rois: list[np.ndarray] = []
     attempted_rois: list[np.ndarray] = []
@@ -326,205 +355,169 @@ def _infer_with_loaded(
         cfg.target_classes,
     )
     max_attempts = int(cfg.max_slice_attempts) if cfg.max_slice_attempts > 0 else int(env_cfg.max_slices * 2)
-    for attempt_idx in range(1, max_attempts + 1):
-        if len(accepted_rois) >= env_cfg.max_slices:
-            break
-        history_arr = (
-            np.stack(attempted_rois).astype(np.float32)
-            if attempted_rois
-            else np.zeros((0, 4), dtype=np.float32)
-        )
-        overlap_arr = (
-            np.stack(accepted_rois).astype(np.float32)
-            if accepted_rois
-            else np.zeros((0, 4), dtype=np.float32)
-        )
-        env = SliceEnv(
-            det,
-            None,
-            env_cfg=env_cfg,
-            state_cfg=state_cfg,
-            previous_rois=history_arr,
-            overlap_rois=overlap_arr,
-            target_classes=cfg.target_classes,
-            class_mapping=cfg.class_mapping,
-        )
-        roi, actions, info = rollout_one_slice(policy, env, device_t)
-        if info.get("stop_due_to_old_overlap", False):
+    crop_batch_size = max(int(cfg.crop_batch_size), 1)
+    crop_prediction_count = 0
+    crop_batch_count = 0
+    attempt_idx = 1
+    stop_attempts = False
+
+    while attempt_idx <= max_attempts and len(accepted_rois) < env_cfg.max_slices and not stop_attempts:
+        remaining_attempts = max_attempts - attempt_idx + 1
+        remaining_slices = max(int(env_cfg.max_slices) - len(accepted_rois), 1)
+        pending_limit = min(crop_batch_size, remaining_attempts, remaining_slices)
+        pending: list[tuple[int, np.ndarray, list[str], dict]] = []
+
+        while (
+            len(pending) < pending_limit
+            and attempt_idx <= max_attempts
+            and len(accepted_rois) < env_cfg.max_slices
+        ):
+            history_arr = (
+                np.stack(attempted_rois).astype(np.float32)
+                if attempted_rois
+                else np.zeros((0, 4), dtype=np.float32)
+            )
+            overlap_arr = (
+                np.stack(accepted_rois).astype(np.float32)
+                if accepted_rois
+                else np.zeros((0, 4), dtype=np.float32)
+            )
+            env = SliceEnv(
+                det,
+                None,
+                env_cfg=env_cfg,
+                state_cfg=state_cfg,
+                previous_rois=history_arr,
+                overlap_rois=overlap_arr,
+                target_classes=cfg.target_classes,
+                class_mapping=cfg.class_mapping,
+            )
+            rollout_start = time.perf_counter()
+            roi, actions, info = rollout_one_slice(policy, env, device_t)
+            timing["rollout_ms"] += (time.perf_counter() - rollout_start) * 1000.0
             repeat_attempt_overlap = _attempt_overlap(roi, attempted_rois)
             attempted_rois.append(roi)
-            rejected_rois.append(roi)
-            slice_meta.append(
-                {
-                    "attempt_index": attempt_idx,
-                    "slice_index": None,
-                    "accepted": False,
-                    "rejection_reason": "old_slice_overlap",
-                    "roi": [float(x) for x in roi.tolist()],
-                    "actions": actions,
-                    "steps": len(actions),
-                    "old_slice_overlap": float(info.get("old_slice_overlap", 0.0)),
-                    "attempted_slice_overlap": float(info.get("attempted_slice_overlap", 0.0)),
-                    "stop_due_to_stalled_roi": bool(info.get("stop_due_to_stalled_roi", False)),
-                    "repeat_attempt_overlap": repeat_attempt_overlap,
-                    "detections": 0,
-                }
-            )
-            if repeat_attempt_overlap >= 0.95:
-                break
-            continue
-        if info.get("stop_due_to_attempted_overlap", False):
-            repeat_attempt_overlap = _attempt_overlap(roi, attempted_rois)
-            attempted_rois.append(roi)
-            rejected_rois.append(roi)
-            slice_meta.append(
-                {
-                    "attempt_index": attempt_idx,
-                    "slice_index": None,
-                    "accepted": False,
-                    "rejection_reason": "attempted_slice_overlap",
-                    "roi": [float(x) for x in roi.tolist()],
-                    "actions": actions,
-                    "steps": len(actions),
-                    "old_slice_overlap": float(info.get("old_slice_overlap", 0.0)),
-                    "attempted_slice_overlap": float(info.get("attempted_slice_overlap", 0.0)),
-                    "stop_due_to_stalled_roi": bool(info.get("stop_due_to_stalled_roi", False)),
-                    "repeat_attempt_overlap": repeat_attempt_overlap,
-                    "detections": 0,
-                }
-            )
-            if repeat_attempt_overlap >= 0.95:
-                break
-            continue
-        if cfg.require_stop_for_acceptance and info.get("stop_due_to_max_steps", False):
-            repeat_attempt_overlap = _attempt_overlap(roi, attempted_rois)
-            attempted_rois.append(roi)
-            rejected_rois.append(roi)
-            slice_meta.append(
-                {
-                    "attempt_index": attempt_idx,
-                    "slice_index": None,
-                    "accepted": False,
-                    "rejection_reason": "max_steps_without_stop",
-                    "roi": [float(x) for x in roi.tolist()],
-                    "actions": actions,
-                    "steps": len(actions),
-                    "old_slice_overlap": float(info.get("old_slice_overlap", 0.0)),
-                    "attempted_slice_overlap": float(info.get("attempted_slice_overlap", 0.0)),
-                    "stop_due_to_stalled_roi": bool(info.get("stop_due_to_stalled_roi", False)),
-                    "repeat_attempt_overlap": repeat_attempt_overlap,
-                    "detections": 0,
-                }
-            )
-            if repeat_attempt_overlap >= 0.95:
-                break
-            continue
-        if cfg.require_stop_for_acceptance and info.get("stop_due_to_stalled_roi", False):
-            repeat_attempt_overlap = _attempt_overlap(roi, attempted_rois)
-            attempted_rois.append(roi)
-            rejected_rois.append(roi)
-            slice_meta.append(
-                {
-                    "attempt_index": attempt_idx,
-                    "slice_index": None,
-                    "accepted": False,
-                    "rejection_reason": "stalled_without_stop",
-                    "roi": [float(x) for x in roi.tolist()],
-                    "actions": actions,
-                    "steps": len(actions),
-                    "old_slice_overlap": float(info.get("old_slice_overlap", 0.0)),
-                    "attempted_slice_overlap": float(info.get("attempted_slice_overlap", 0.0)),
-                    "stop_due_to_stalled_roi": bool(info.get("stop_due_to_stalled_roi", False)),
-                    "repeat_attempt_overlap": repeat_attempt_overlap,
-                    "detections": 0,
-                }
-            )
-            if repeat_attempt_overlap >= 0.95:
-                break
+            skip_reason = _skip_crop_reason(info, cfg)
+            if skip_reason is not None:
+                rejected_rois.append(roi)
+                slice_meta.append(
+                    {
+                        "attempt_index": attempt_idx,
+                        "slice_index": None,
+                        "accepted": False,
+                        "rejection_reason": skip_reason,
+                        "roi": [float(x) for x in roi.tolist()],
+                        "actions": actions,
+                        "steps": len(actions),
+                        "old_slice_overlap": float(info.get("old_slice_overlap", 0.0)),
+                        "attempted_slice_overlap": float(info.get("attempted_slice_overlap", 0.0)),
+                        "stop_due_to_stalled_roi": bool(info.get("stop_due_to_stalled_roi", False)),
+                        "repeat_attempt_overlap": repeat_attempt_overlap,
+                        "detections": 0,
+                    }
+                )
+                if repeat_attempt_overlap >= 0.95:
+                    stop_attempts = True
+                    break
+            else:
+                pending.append((attempt_idx, roi, actions, info))
+            attempt_idx += 1
+
+        if not pending:
             continue
 
-        boxes_i, scores_i, classes_i = run_yolo_on_crop(
+        crop_start = time.perf_counter()
+        crop_predictions = run_yolo_on_crops(
             yolo,
-            image_path,
-            roi,
+            [image_path] * len(pending),
+            [roi for _pending_attempt_idx, roi, _actions, _info in pending],
             imgsz=cfg.slice_imgsz,
             conf=cfg.output_conf,
             iou=cfg.iou,
             max_det=cfg.max_det,
             device=cfg.device,
         )
-        classes_i = cfg.class_mapping.map_model_classes(classes_i)
-        boxes_i, scores_i, classes_i = _filter_classes(boxes_i, scores_i, classes_i, cfg.target_classes)
-        attempted_rois.append(roi)
-        new_detection_gain = _new_detection_gain(
-            full_boxes,
-            full_scores,
-            full_classes,
-            slice_boxes_all,
-            slice_scores_all,
-            slice_classes_all,
-            boxes_i,
-            scores_i,
-            classes_i,
-            det.image_shape,
-            cfg.merge_iou,
-            cfg.duplicate_iou,
-        )
-        new_detection_utility = _new_detection_utility(
-            full_boxes,
-            full_scores,
-            full_classes,
-            slice_boxes_all,
-            slice_scores_all,
-            slice_classes_all,
-            boxes_i,
-            scores_i,
-            classes_i,
-            det.image_shape,
-            cfg.merge_iou,
-            cfg.duplicate_iou,
-        )
-        accepted = (
-            new_detection_gain >= int(cfg.min_slice_detections)
-            and new_detection_utility >= float(cfg.min_slice_utility)
-        )
-        if accepted:
-            rejection_reason = None
-        elif len(boxes_i) == 0:
-            rejection_reason = "empty_slice"
-        elif new_detection_gain <= 0:
-            rejection_reason = "no_new_detection_after_nms"
-        elif new_detection_utility < float(cfg.min_slice_utility):
-            rejection_reason = "low_new_detection_utility"
-        else:
-            rejection_reason = "low_new_detection_count"
-        slice_index = None
-        if accepted:
-            accepted_rois.append(roi)
-            slice_index = len(accepted_rois)
-            slice_boxes_all.append(boxes_i)
-            slice_scores_all.append(scores_i)
-            slice_classes_all.append(classes_i)
-        else:
-            rejected_rois.append(roi)
-        slice_meta.append(
-            {
-                "attempt_index": attempt_idx,
-                "slice_index": slice_index,
-                "accepted": accepted,
-                "rejection_reason": rejection_reason,
-                "roi": [float(x) for x in roi.tolist()],
-                "actions": actions,
-                "steps": len(actions),
-                "old_slice_overlap": float(info.get("old_slice_overlap", 0.0)),
-                "attempted_slice_overlap": float(info.get("attempted_slice_overlap", 0.0)),
-                "stop_due_to_stalled_roi": bool(info.get("stop_due_to_stalled_roi", False)),
-                "detections": int(len(boxes_i)),
-                "new_detections_after_nms": int(new_detection_gain),
-                "new_detection_utility": float(new_detection_utility),
-            }
-        )
+        timing["crop_inference_ms"] += (time.perf_counter() - crop_start) * 1000.0
+        crop_prediction_count += len(pending)
+        crop_batch_count += 1
 
+        for (pending_attempt_idx, roi, actions, info), (boxes_i, scores_i, classes_i) in zip(
+            pending,
+            crop_predictions,
+        ):
+            classes_i = cfg.class_mapping.map_model_classes(classes_i)
+            boxes_i, scores_i, classes_i = _filter_classes(boxes_i, scores_i, classes_i, cfg.target_classes)
+            new_detection_gain = _new_detection_gain(
+                full_boxes,
+                full_scores,
+                full_classes,
+                slice_boxes_all,
+                slice_scores_all,
+                slice_classes_all,
+                boxes_i,
+                scores_i,
+                classes_i,
+                det.image_shape,
+                cfg.merge_iou,
+                cfg.duplicate_iou,
+            )
+            new_detection_utility = _new_detection_utility(
+                full_boxes,
+                full_scores,
+                full_classes,
+                slice_boxes_all,
+                slice_scores_all,
+                slice_classes_all,
+                boxes_i,
+                scores_i,
+                classes_i,
+                det.image_shape,
+                cfg.merge_iou,
+                cfg.duplicate_iou,
+            )
+            accepted = (
+                new_detection_gain >= int(cfg.min_slice_detections)
+                and new_detection_utility >= float(cfg.min_slice_utility)
+            )
+            if accepted:
+                rejection_reason = None
+            elif len(boxes_i) == 0:
+                rejection_reason = "empty_slice"
+            elif new_detection_gain <= 0:
+                rejection_reason = "no_new_detection_after_nms"
+            elif new_detection_utility < float(cfg.min_slice_utility):
+                rejection_reason = "low_new_detection_utility"
+            else:
+                rejection_reason = "low_new_detection_count"
+            slice_index = None
+            if accepted:
+                accepted_rois.append(roi)
+                slice_index = len(accepted_rois)
+                slice_boxes_all.append(boxes_i)
+                slice_scores_all.append(scores_i)
+                slice_classes_all.append(classes_i)
+            else:
+                rejected_rois.append(roi)
+            slice_meta.append(
+                {
+                    "attempt_index": pending_attempt_idx,
+                    "slice_index": slice_index,
+                    "accepted": bool(accepted),
+                    "rejection_reason": rejection_reason,
+                    "roi": [float(x) for x in roi.tolist()],
+                    "actions": actions,
+                    "steps": len(actions),
+                    "old_slice_overlap": float(info.get("old_slice_overlap", 0.0)),
+                    "attempted_slice_overlap": float(info.get("attempted_slice_overlap", 0.0)),
+                    "stop_due_to_stalled_roi": bool(info.get("stop_due_to_stalled_roi", False)),
+                    "detections": int(len(boxes_i)),
+                    "new_detections_after_nms": int(new_detection_gain),
+                    "new_detection_utility": float(new_detection_utility),
+                    "crop_batch_size": len(pending),
+                }
+            )
+
+    merge_start = time.perf_counter()
     boxes_parts = [full_boxes] + slice_boxes_all
     scores_parts = [full_scores] + slice_scores_all
     classes_parts = [full_classes] + slice_classes_all
@@ -541,6 +534,7 @@ def _infer_with_loaded(
     boxes = clip_boxes(boxes, det.image_shape)
     keep = class_aware_nms(boxes, scores, classes, cfg.merge_iou)
     boxes, scores, classes, sources = boxes[keep], scores[keep], classes[keep], sources[keep]
+    timing["merge_ms"] = (time.perf_counter() - merge_start) * 1000.0
 
     out_dir = Path(out_dir)
     pred_path = out_dir / "detections" / f"{image_path.stem}.txt"
@@ -552,20 +546,30 @@ def _infer_with_loaded(
     rejected_rois_array = (
         np.stack(rejected_rois).astype(np.float32) if rejected_rois else np.zeros((0, 4), dtype=np.float32)
     )
-    save_prediction_txt(pred_path, boxes, scores, classes, sources)
-    save_inference_visual(image_path, boxes, sources, accepted_rois_array, rejected_rois_array, viz_path)
-    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    write_start = time.perf_counter()
+    if cfg.save_predictions:
+        save_prediction_txt(pred_path, boxes, scores, classes, sources)
+    if cfg.save_visualization:
+        save_inference_visual(image_path, boxes, sources, accepted_rois_array, rejected_rois_array, viz_path)
+    timing["write_outputs_ms"] = (time.perf_counter() - write_start) * 1000.0
+    timing["total_ms"] = (time.perf_counter() - request_start) * 1000.0
     meta = {
         "image": str(image_path),
         "num_slices": len(accepted_rois),
         "num_attempts": len(slice_meta),
         "num_rejected_slices": len(rejected_rois),
+        "num_crop_predictions": crop_prediction_count,
+        "num_crop_batches": crop_batch_count,
         "slices": slice_meta,
         "detections": int(len(boxes)),
-        "prediction_file": str(pred_path),
-        "visualization_file": str(viz_path),
+        "prediction_file": str(pred_path) if cfg.save_predictions else None,
+        "visualization_file": str(viz_path) if cfg.save_visualization else None,
+        "metadata_file": str(meta_path) if cfg.save_metadata else None,
+        "timing": timing,
     }
-    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    if cfg.save_metadata:
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return meta
 
 
@@ -583,6 +587,17 @@ def _config_path_or_override(cfg: ProjectConfig, key: str, value: Path | str | N
 def _value_or_config(section: dict, key: str, value, cast):
     raw = section[key] if value is None else value
     return cast(raw)
+
+
+def _optional_value_or_config(section: dict, key: str, value, default, cast):
+    raw = section.get(key, default) if value is None else value
+    return cast(raw)
+
+
+def _bool_value(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
 
 
 def _feature_layers_or_config(cfg: ProjectConfig, value: tuple[int, ...] | list[int] | str | None) -> tuple[int, ...]:
@@ -622,8 +637,12 @@ def infer_one_image(
     min_slice_utility: float | None = None,
     duplicate_iou: float | None = None,
     max_slice_attempts: int | None = None,
+    crop_batch_size: int | None = None,
     target_classes: tuple[int, ...] | list[int] | str | None = None,
     require_stop_for_acceptance: bool | None = None,
+    save_predictions: bool | None = None,
+    save_metadata: bool | None = None,
+    save_visualization: bool | None = None,
     class_mapping: ClassMapping | None = None,
     config: ProjectConfig | Path | str | None = None,
 ) -> dict:
@@ -658,13 +677,29 @@ def infer_one_image(
             else float(duplicate_iou)
         ),
         max_slice_attempts=_value_or_config(infer_cfg, "max_slice_attempts", max_slice_attempts, int),
+        crop_batch_size=_optional_value_or_config(infer_cfg, "crop_batch_size", crop_batch_size, 1, int),
         target_classes=_int_tuple_value(
             target_classes if target_classes is not None else infer_cfg.get("target_classes", (0, 2, 3, 5, 8, 9))
         ),
         require_stop_for_acceptance=(
-            bool(infer_cfg.get("require_stop_for_acceptance", True))
+            _bool_value(infer_cfg.get("require_stop_for_acceptance", True))
             if require_stop_for_acceptance is None
-            else bool(require_stop_for_acceptance)
+            else _bool_value(require_stop_for_acceptance)
+        ),
+        save_predictions=(
+            _bool_value(infer_cfg.get("save_predictions", True))
+            if save_predictions is None
+            else _bool_value(save_predictions)
+        ),
+        save_metadata=(
+            _bool_value(infer_cfg.get("save_metadata", True))
+            if save_metadata is None
+            else _bool_value(save_metadata)
+        ),
+        save_visualization=(
+            _bool_value(infer_cfg.get("save_visualization", False))
+            if save_visualization is None
+            else _bool_value(save_visualization)
         ),
         class_mapping=class_mapping or ClassMapping.from_config(project_cfg.section("classes")),
     )
